@@ -1,6 +1,7 @@
 import { createApi, fetchBaseQuery } from "@reduxjs/toolkit/query/react";
+import type { BaseQueryFn, FetchArgs, FetchBaseQueryError } from "@reduxjs/toolkit/query/react";
 import * as i18nextNs from "i18next";
-import { readAccessToken } from "@/lib/auth";
+import { readAccessToken, tryRefreshToken, clearSessionAndRedirect } from "@/lib/auth";
 
 // Federation interop: normalize the shared i18next namespace to the real instance.
 const i18next = ((i18nextNs as unknown as { default?: typeof import("i18next").default }).default
@@ -26,23 +27,44 @@ import type {
  * `baseUrl` is "/api" (relative): standalone it hits the Vite proxy; embedded it hits the
  * shell's origin which fronts the same gateway. No absolute host is ever baked in.
  */
+const rawBaseQuery = fetchBaseQuery({
+  baseUrl: "/api",
+  prepareHeaders: (headers) => {
+    // Bearer token: resolved fresh per request from the shared auth channel.
+    const token = readAccessToken();
+    if (token) headers.set("Authorization", `Bearer ${token}`);
+
+    // Accept-Language drives the backend's localized AI summary + any localized messages.
+    // Always read the LIVE i18next language so language switches in the shell propagate.
+    headers.set("Accept-Language", i18next.language || "en");
+    return headers;
+  },
+});
+
+// On a 401 (expired access token) try ONE silent refresh, then retry the request. If the
+// refresh fails (no/expired refresh token), bounce to login instead of dead-ending.
+const baseQueryWithReauth: BaseQueryFn<string | FetchArgs, unknown, FetchBaseQueryError> = async (
+  args,
+  apiCtx,
+  extraOptions,
+) => {
+  let result = await rawBaseQuery(args, apiCtx, extraOptions);
+  if (result.error && result.error.status === 401) {
+    const fresh = await tryRefreshToken();
+    if (fresh) {
+      result = await rawBaseQuery(args, apiCtx, extraOptions); // prepareHeaders re-reads the new token
+    } else {
+      clearSessionAndRedirect();
+    }
+  }
+  return result;
+};
+
 export const accountsApi = createApi({
   // Unique reducerPath so this slice can be safely combined into the shell's store
   // alongside the shell's own / other remotes' slices without key collisions.
   reducerPath: "accountsApi",
-  baseQuery: fetchBaseQuery({
-    baseUrl: "/api",
-    prepareHeaders: (headers) => {
-      // Bearer token: resolved fresh per request from the shared auth channel.
-      const token = readAccessToken();
-      if (token) headers.set("Authorization", `Bearer ${token}`);
-
-      // Accept-Language drives the backend's localized AI summary + any localized messages.
-      // Always read the LIVE i18next language so language switches in the shell propagate.
-      headers.set("Accept-Language", i18next.language || "en");
-      return headers;
-    },
-  }),
+  baseQuery: baseQueryWithReauth,
   tagTypes: ["Account", "Transactions"],
   endpoints: (builder) => ({
     /** GET /api/accounts — list all accounts for the authenticated customer. */
